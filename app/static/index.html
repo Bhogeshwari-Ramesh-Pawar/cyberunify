@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CyberUnify · SOC Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark">CU</span><div><b>CyberUnify</b><small>Unified SOC Dashboard</small></div></div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+      <button role="tab" data-tab="alerts">Alerts</button>
+      <button role="tab" data-tab="hosts">Hosts</button>
+      <button role="tab" data-tab="compliance">ISO 27001</button>
+      <button role="tab" data-tab="vendors">Third-party risk</button>
+    </nav>
+    <div class="top-actions">
+      <span id="last-sync" class="muted mono small"></span>
+      <button id="ingest-btn" class="btn">↻ Ingest now</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- OVERVIEW -->
+    <section id="tab-overview" class="tab active">
+      <div class="sources" id="sources"></div>
+      <div class="kpis" id="kpis"></div>
+      <div class="grid-2">
+        <div class="panel wide"><h3>Alerts over the last 48 hours</h3><div class="chart-box tall"><canvas id="chart-timeline"></canvas></div></div>
+        <div class="panel"><h3>Active alerts by risk</h3><div class="chart-box"><canvas id="chart-levels"></canvas></div></div>
+      </div>
+      <div class="grid-3">
+        <div class="panel"><h3>Riskiest hosts</h3><div id="top-hosts"></div></div>
+        <div class="panel"><h3>MITRE ATT&amp;CK tactics</h3><div class="chart-box"><canvas id="chart-tactics"></canvas></div></div>
+        <div class="panel"><h3>Alert categories</h3><div class="chart-box"><canvas id="chart-categories"></canvas></div></div>
+      </div>
+      <div class="panel"><h3>Top active alerts</h3><div class="table-wrap"><table id="top-alerts" class="alerts"></table></div></div>
+    </section>
+
+    <!-- ALERTS -->
+    <section id="tab-alerts" class="tab">
+      <form class="filters" id="filters">
+        <input type="search" name="q" placeholder="Search title, host, IP, user, technique…" />
+        <select name="level"><option value="">All risk levels</option></select>
+        <select name="source"><option value="">All sources</option></select>
+        <select name="host"><option value="">All hosts</option></select>
+        <select name="category"><option value="">All categories</option></select>
+        <select name="status"><option value="">Any status</option></select>
+        <select name="sort"><option value="risk">Sort: highest risk</option><option value="time">Sort: newest</option></select>
+      </form>
+      <div class="panel">
+        <div class="table-wrap"><table id="alerts-table" class="alerts"></table></div>
+        <div class="pager"><span id="alerts-count" class="muted"></span><div><button class="btn ghost" id="prev">← Prev</button><button class="btn ghost" id="next">Next →</button></div></div>
+      </div>
+    </section>
+
+    <!-- HOSTS -->
+    <section id="tab-hosts" class="tab">
+      <div class="panel"><h3>Host risk ranking</h3><p class="muted small">Worst active alert per host, lifted by its other alerts. Click a host to see its alerts.</p><div class="table-wrap"><table id="hosts-table"></table></div></div>
+    </section>
+
+    <!-- COMPLIANCE -->
+    <section id="tab-compliance" class="tab">
+      <div class="compliance-head">
+        <div class="posture" id="posture"></div>
+        <div class="report-actions">
+          <a class="btn" href="/reports/iso27001" target="_blank" rel="noopener">Open report</a>
+          <a class="btn ghost" href="/reports/iso27001?download=true">Download report</a>
+        </div>
+      </div>
+      <div class="controls" id="controls"></div>
+    </section>
+
+    <!-- VENDORS -->
+    <section id="tab-vendors" class="tab">
+      <div class="grid-2">
+        <div class="panel wide"><h3>Vendor risk register</h3><div class="table-wrap"><table id="vendors-table"></table></div></div>
+        <form class="panel" id="vendor-form">
+          <h3>Assess a vendor</h3>
+          <label>Vendor name<input name="name" required maxlength="120" /></label>
+          <label>Service provided<input name="service" maxlength="200" placeholder="e.g. Payroll SaaS" /></label>
+          <div class="row">
+            <label>Data sensitivity<select name="data_sensitivity"><option>low</option><option selected>medium</option><option>high</option></select></label>
+            <label>Access to our systems<select name="access_level"><option>none</option><option selected>limited</option><option>privileged</option></select></label>
+          </div>
+          <fieldset><legend>Controls the vendor has in place</legend><div id="questions"></div></fieldset>
+          <button class="btn" type="submit">Calculate &amp; save</button>
+          <p id="vendor-status" class="small"></p>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <!-- alert detail drawer -->
+  <aside class="drawer" id="drawer" aria-hidden="true">
+    <div class="drawer-inner">
+      <button class="close" id="drawer-close" aria-label="Close">✕</button>
+      <div id="drawer-body"></div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+  <div class="toast" id="toast" role="status"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

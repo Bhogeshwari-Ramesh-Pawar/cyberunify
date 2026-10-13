@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CyberUnify · ISO 27001 Compliance Report</title>
+<style>
+  :root { --ink:#0f172a; --muted:#5b6678; --line:#e2e8f0; --bg:#ffffff; --soft:#f6f8fb;
+          --crit:#b91c1c; --high:#c2410c; --med:#a16207; --low:#15803d; --none:#64748b; --accent:#0e7490; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--soft); color:var(--ink); font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .page { max-width:980px; margin:24px auto; background:var(--bg); padding:40px 44px; border:1px solid var(--line); border-radius:12px; }
+  header { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; border-bottom:3px solid var(--accent); padding-bottom:18px; margin-bottom:24px; }
+  h1 { margin:0 0 4px; font-size:24px; }
+  h2 { font-size:17px; margin:32px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+  .muted { color:var(--muted); }
+  .brand { font-weight:800; color:var(--accent); letter-spacing:.02em; }
+  .meta { text-align:right; font-size:12.5px; color:var(--muted); }
+  .kpis { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; }
+  .kpi { background:var(--soft); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .kpi b { display:block; font-size:22px; }
+  .kpi span { font-size:12px; color:var(--muted); }
+  .posture { display:flex; align-items:center; gap:18px; background:var(--soft); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .posture .big { font-size:40px; font-weight:800; color:var(--accent); line-height:1; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { background:var(--soft); font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11.5px; font-weight:600; border:1px solid currentColor; white-space:nowrap; }
+  .s-at-risk, .critical, .t-Critical { color:var(--crit); }
+  .s-needs-review, .high, .t-High { color:var(--high); }
+  .medium, .t-Medium { color:var(--med); }
+  .s-effective, .low, .t-Low { color:var(--low); }
+  .s-no-evidence { color:var(--none); }
+  ul.ev { margin:0; padding-left:16px; }
+  .rec { color:var(--ink); font-size:12.5px; }
+  .note { font-size:12px; color:var(--muted); margin-top:28px; border-top:1px solid var(--line); padding-top:12px; }
+  .print { position:fixed; right:18px; bottom:18px; background:var(--accent); color:#fff; border:0; padding:10px 16px; border-radius:8px; font-weight:600; cursor:pointer; }
+  @media print { body { background:#fff; } .page { margin:0; border:0; padding:0; } .print { display:none; } h2 { break-after:avoid; } tr { break-inside:avoid; } }
+  @media (max-width:700px) { .page { padding:20px 16px; margin:0; border-radius:0; } .kpis { grid-template-columns:repeat(2,1fr); } header { flex-direction:column; } .meta { text-align:left; } table { font-size:12px; } }
+</style>
+</head>
+<body>
+<button class="print" onclick="window.print()">Print / Save as PDF</button>
+<div class="page">
+  <header>
+    <div>
+      <div class="brand">CYBERUNIFY</div>
+      <h1>ISO/IEC 27001:2022 Compliance Report</h1>
+      <div class="muted">Annex A control assessment based on SOC alert evidence</div>
+    </div>
+    <div class="meta">Generated {{ generated }}<br>Evidence window: last {{ window_hours }} hours</div>
+  </header>
+
+  <h2>1. Executive summary</h2>
+  <div class="posture">
+    <div class="big">{{ report.summary.posture_score }}%</div>
+    <div>
+      <b>Control posture</b> — share of assessed controls currently effective.<br>
+      <span class="muted">{{ report.summary.at_risk }} at risk · {{ report.summary.needs_review }} need review ·
+        {{ report.summary.effective }} effective · {{ report.summary.no_evidence }} without evidence
+        (of {{ report.summary.controls }} controls in scope)</span>
+    </div>
+  </div>
+  <div class="kpis" style="margin-top:12px">
+    <div class="kpi"><b>{{ kpis.alerts }}</b><span>Alerts in window</span></div>
+    <div class="kpi"><b>{{ kpis.open }}</b><span>Untriaged</span></div>
+    <div class="kpi"><b class="critical">{{ kpis.critical }}</b><span>Critical (active)</span></div>
+    <div class="kpi"><b class="high">{{ kpis.high }}</b><span>High (active)</span></div>
+    <div class="kpi"><b>{{ kpis.hosts }}</b><span>Hosts affected</span></div>
+  </div>
+
+  <h2>2. Annex A control assessment</h2>
+  <table>
+    <thead><tr><th style="width:70px">Control</th><th>Name</th><th style="width:105px">Status</th><th>Evidence</th><th>Recommended action</th></tr></thead>
+    <tbody>
+    {% for c in report.controls %}
+      <tr>
+        <td><b>{{ c.control }}</b></td>
+        <td>{{ c.name }}</td>
+        <td><span class="pill s-{{ c.status|lower|replace(' ', '-') }}">{{ c.status }}</span></td>
+        <td>{% if c.evidence %}<ul class="ev">{% for e in c.evidence %}<li>{{ e }}</li>{% endfor %}</ul>{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="rec">{{ c.recommendation or "—" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>3. Highest-risk assets</h2>
+  <table>
+    <thead><tr><th>Host</th><th>Risk</th><th>Alerts</th><th>Critical / High</th><th>Worst finding</th></tr></thead>
+    <tbody>
+    {% for h in hosts %}
+      <tr><td><b>{{ h.host }}</b></td><td><span class="pill {{ h.risk_level }}">{{ "%.0f"|format(h.risk_score) }} · {{ h.risk_level }}</span></td>
+          <td>{{ h.alerts }}</td><td>{{ h.critical }} / {{ h.high }}</td><td>{{ h.top_alert }}</td></tr>
+    {% else %}
+      <tr><td colspan="5" class="muted">No active alerts.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>4. Top active alerts</h2>
+  <table>
+    <thead><tr><th>Risk</th><th>Time (UTC)</th><th>Host</th><th>Alert</th><th>MITRE ATT&amp;CK</th><th>Source</th></tr></thead>
+    <tbody>
+    {% for a in top_alerts %}
+      <tr><td><span class="pill {{ a.risk_level }}">{{ "%.0f"|format(a.risk_score) }}</span></td>
+          <td>{{ a.timestamp.strftime("%d %b %H:%M") }}</td><td>{{ a.host }}</td><td>{{ a.title }}</td>
+          <td>{{ a.mitre_technique or "—" }}{% if a.mitre_tactic %}<br><span class="muted">{{ a.mitre_tactic|title }}</span>{% endif %}</td>
+          <td>{{ a.source }}</td></tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No active alerts.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>5. Third-party risk (A.5.19)</h2>
+  <table>
+    <thead><tr><th>Vendor</th><th>Service</th><th>Inherent</th><th>Controls met</th><th>Residual</th><th>Top gaps</th></tr></thead>
+    <tbody>
+    {% for v in vendors %}
+      <tr><td><b>{{ v.name }}</b></td><td>{{ v.service }}</td><td>{{ "%.0f"|format(v.inherent_risk) }}</td>
+          <td>{{ "%.0f"|format(v.control_score) }}%</td>
+          <td><span class="pill t-{{ v.tier }}">{{ "%.0f"|format(v.residual_risk) }} · {{ v.tier }}</span></td>
+          <td>{% if v.gaps %}<ul class="ev">{% for g in v.gaps[:3] %}<li>{{ g }}</li>{% endfor %}</ul>{% else %}<span class="muted">None</span>{% endif %}</td></tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No vendors assessed.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <p class="note">
+    Method: each alert category maps to the Annex A controls it evidences. A control is <b>At risk</b> when it has
+    open critical/high alerts, <b>Needs review</b> with open medium alerts, and <b>Effective</b> when only low or
+    resolved alerts remain. <b>No evidence</b> is not a pass. A.8.15 is assessed from data-source health; A.8.16
+    and A.5.26 from untriaged high-risk alerts; A.5.19 from the third-party risk register. This report supports,
+    but does not replace, a formal ISO 27001 audit.
+  </p>
+</div>
+</body>
+</html>
