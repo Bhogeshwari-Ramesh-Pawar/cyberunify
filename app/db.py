@@ -1,4 +1,4 @@
-"""SQLite storage for alerts, ingest runs and vendor assessments."""
+"""SQLite storage: unified events, integrations, ingest runs and vendor assessments."""
 
 from __future__ import annotations
 
@@ -10,42 +10,59 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import Alert
+from .models import Event
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS alerts (
+CREATE TABLE IF NOT EXISTS events (
     id              TEXT PRIMARY KEY,
-    source          TEXT NOT NULL,
+    integration_id  INTEGER NOT NULL,
+    tool            TEXT NOT NULL,
     source_id       TEXT NOT NULL,
     timestamp       TEXT NOT NULL,
+    ts_epoch        INTEGER NOT NULL,
     host            TEXT NOT NULL,
-    rule_id         TEXT NOT NULL,
-    title           TEXT NOT NULL,
-    category        TEXT NOT NULL,
+    message         TEXT NOT NULL,
     severity        INTEGER NOT NULL,
+    category        TEXT NOT NULL,
     src_ip          TEXT,
     dst_ip          TEXT,
     user            TEXT,
+    rule            TEXT,
+    action          TEXT,
     mitre_tactic    TEXT,
     mitre_technique TEXT,
     raw             TEXT NOT NULL,
     risk_score      REAL NOT NULL DEFAULT 0,
+    risk_level      TEXT NOT NULL DEFAULT 'info',
     risk_factors    TEXT NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'open',
     ingested_at     TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_alerts_ts   ON alerts(timestamp);
-CREATE INDEX IF NOT EXISTS idx_alerts_host ON alerts(host);
+CREATE INDEX IF NOT EXISTS idx_events_ts    ON events(ts_epoch);
+CREATE INDEX IF NOT EXISTS idx_events_tool  ON events(tool, ts_epoch);
+CREATE INDEX IF NOT EXISTS idx_events_host  ON events(host, ts_epoch);
+CREATE INDEX IF NOT EXISTS idx_events_level ON events(risk_level, ts_epoch);
+CREATE INDEX IF NOT EXISTS idx_events_integ ON events(integration_id, ts_epoch);
 
-CREATE TABLE IF NOT EXISTS ingest_runs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    source      TEXT NOT NULL,
-    started_at  TEXT NOT NULL,
-    finished_at TEXT NOT NULL,
-    status      TEXT NOT NULL,
-    fetched     INTEGER NOT NULL DEFAULT 0,
-    skipped     INTEGER NOT NULL DEFAULT 0,
-    error       TEXT
+CREATE TABLE IF NOT EXISTS integrations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    name               TEXT NOT NULL,
+    tool               TEXT NOT NULL,
+    type               TEXT NOT NULL,
+    config             TEXT NOT NULL,
+    mapping            TEXT NOT NULL DEFAULT '{}',
+    severity_scale     TEXT NOT NULL DEFAULT 'auto',
+    default_category   TEXT,
+    enabled            INTEGER NOT NULL DEFAULT 1,
+    demo               INTEGER NOT NULL DEFAULT 0,
+    webhook_token_hash TEXT UNIQUE,
+    webhook_token      TEXT,
+    state              TEXT NOT NULL DEFAULT '{}',
+    last_status        TEXT,
+    last_error         TEXT,
+    last_run_at        TEXT,
+    last_count         INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS vendors (
@@ -64,7 +81,10 @@ CREATE TABLE IF NOT EXISTS vendors (
 );
 """
 
-ALERT_STATUSES = ("open", "acknowledged", "closed", "false_positive")
+EVENT_STATUSES = ("open", "acknowledged", "closed", "false_positive")
+INTEGRATION_COLUMNS = ("name", "tool", "type", "config", "mapping", "severity_scale", "default_category",
+                       "enabled", "demo", "webhook_token_hash", "webhook_token", "state", "last_status",
+                       "last_error", "last_run_at", "last_count")
 
 
 def _now() -> str:
@@ -76,113 +96,136 @@ class Database:
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        # One shared connection; the lock keeps the background ingester and API requests from colliding.
+        # One shared connection guarded by a lock: syslog listeners, webhooks, the scheduler
+        # and API requests all write through here.
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL") if self.path != ":memory:" else None
             self._conn.executescript(SCHEMA)
 
     def close(self) -> None:
         self._conn.close()
 
-    def _query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+    def query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(sql, tuple(params)).fetchall()
 
-    def _execute(self, sql: str, params: Iterable[Any] = ()) -> int:
+    def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         with self._lock, self._conn:
-            return self._conn.execute(sql, tuple(params)).lastrowid or 0
+            return self._conn.execute(sql, tuple(params))
 
-    # ---------- alerts ----------
+    # ---------- events ----------
 
-    def upsert_alerts(self, alerts: Iterable[Alert]) -> int:
+    def upsert_events(self, events: Iterable[Event]) -> int:
         rows = [
-            (a.id, a.source, a.source_id, a.timestamp.isoformat(), a.host, a.rule_id, a.title, a.category,
-             a.severity, a.src_ip, a.dst_ip, a.user, a.mitre_tactic, a.mitre_technique,
-             json.dumps(a.raw, default=str), a.risk_score, json.dumps(a.risk_factors), _now())
-            for a in alerts
+            (e.id, e.integration_id, e.tool, e.source_id, e.timestamp.isoformat(), int(e.timestamp.timestamp()),
+             e.host, e.message, e.severity, e.category, e.src_ip, e.dst_ip, e.user, e.rule, e.action,
+             e.mitre_tactic, e.mitre_technique, json.dumps(e.raw, default=str), e.risk_score, e.risk_level,
+             json.dumps(e.risk_factors), _now())
+            for e in events
         ]
-        # On conflict, refresh everything except the analyst's triage status.
+        if not rows:
+            return 0
+        # On conflict refresh everything except the analyst's triage status.
         sql = """
-        INSERT INTO alerts (id, source, source_id, timestamp, host, rule_id, title, category, severity,
-                            src_ip, dst_ip, user, mitre_tactic, mitre_technique, raw, risk_score,
-                            risk_factors, ingested_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO events (id, integration_id, tool, source_id, timestamp, ts_epoch, host, message, severity,
+                            category, src_ip, dst_ip, user, rule, action, mitre_tactic, mitre_technique, raw,
+                            risk_score, risk_level, risk_factors, ingested_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
-            timestamp=excluded.timestamp, host=excluded.host, rule_id=excluded.rule_id,
-            title=excluded.title, category=excluded.category, severity=excluded.severity,
-            src_ip=excluded.src_ip, dst_ip=excluded.dst_ip, user=excluded.user,
-            mitre_tactic=excluded.mitre_tactic, mitre_technique=excluded.mitre_technique,
-            raw=excluded.raw, risk_score=excluded.risk_score, risk_factors=excluded.risk_factors,
-            ingested_at=excluded.ingested_at
+            timestamp=excluded.timestamp, ts_epoch=excluded.ts_epoch, host=excluded.host, message=excluded.message,
+            severity=excluded.severity, category=excluded.category, src_ip=excluded.src_ip, dst_ip=excluded.dst_ip,
+            user=excluded.user, rule=excluded.rule, action=excluded.action, mitre_tactic=excluded.mitre_tactic,
+            mitre_technique=excluded.mitre_technique, raw=excluded.raw, risk_score=excluded.risk_score,
+            risk_level=excluded.risk_level, risk_factors=excluded.risk_factors, ingested_at=excluded.ingested_at
         """
         with self._lock, self._conn:
             self._conn.executemany(sql, rows)
         return len(rows)
 
-    def alerts_since(self, since: datetime) -> list[Alert]:
-        rows = self._query("SELECT * FROM alerts WHERE timestamp >= ? ORDER BY timestamp", [since.isoformat()])
-        return [row_to_alert(r) for r in rows]
-
-    def alert_statuses(self, ids: Iterable[str]) -> dict[str, str]:
-        ids = list(ids)
-        if not ids:
-            return {}
-        result: dict[str, str] = {}
-        for i in range(0, len(ids), 500):  # stay under SQLite's parameter limit
-            chunk = ids[i:i + 500]
-            marks = ",".join("?" * len(chunk))
-            for r in self._query(f"SELECT id, status FROM alerts WHERE id IN ({marks})", chunk):
-                result[r["id"]] = r["status"]
-        return result
-
-    def get_alert(self, alert_id: str) -> tuple[Alert, str] | None:
-        rows = self._query("SELECT * FROM alerts WHERE id = ?", [alert_id])
-        return (row_to_alert(rows[0]), rows[0]["status"]) if rows else None
-
-    def set_alert_status(self, alert_id: str, status: str) -> bool:
-        if status not in ALERT_STATUSES:
-            raise ValueError(f"status must be one of {ALERT_STATUSES}")
+    def update_scores(self, events: Iterable[Event]) -> None:
+        rows = [(e.risk_score, e.risk_level, json.dumps(e.risk_factors), e.id) for e in events]
         with self._lock, self._conn:
-            cur = self._conn.execute("UPDATE alerts SET status = ? WHERE id = ?", (status, alert_id))
-            return cur.rowcount > 0
+            self._conn.executemany("UPDATE events SET risk_score=?, risk_level=?, risk_factors=? WHERE id=?", rows)
 
-    def latest_alert_time(self, source: str) -> datetime | None:
-        rows = self._query("SELECT MAX(timestamp) AS ts FROM alerts WHERE source = ?", [source])
-        ts = rows[0]["ts"] if rows else None
-        return datetime.fromisoformat(ts) if ts else None
+    def events_since(self, since_epoch: int) -> list[Event]:
+        rows = self.query("SELECT * FROM events WHERE ts_epoch >= ? ORDER BY ts_epoch", [since_epoch])
+        return [row_to_event(r) for r in rows]
 
-    # ---------- ingest runs ----------
+    def get_event(self, event_id: str) -> tuple[Event, str] | None:
+        rows = self.query("SELECT * FROM events WHERE id = ?", [event_id])
+        return (row_to_event(rows[0]), rows[0]["status"]) if rows else None
 
-    def record_run(self, source: str, started: datetime, status: str, fetched: int, skipped: int, error: str | None) -> None:
-        self._execute(
-            "INSERT INTO ingest_runs (source, started_at, finished_at, status, fetched, skipped, error) VALUES (?,?,?,?,?,?,?)",
-            [source, started.isoformat(), _now(), status, fetched, skipped, error],
-        )
+    def set_status(self, event_id: str, status: str) -> bool:
+        if status not in EVENT_STATUSES:
+            raise ValueError(f"status must be one of {EVENT_STATUSES}")
+        return self.execute("UPDATE events SET status = ? WHERE id = ?", (status, event_id)).rowcount > 0
 
-    def last_runs(self) -> list[dict[str, Any]]:
-        rows = self._query(
-            """SELECT r.* FROM ingest_runs r
-               JOIN (SELECT source, MAX(id) AS id FROM ingest_runs GROUP BY source) last ON last.id = r.id
-               ORDER BY r.source"""
-        )
-        return [dict(r) for r in rows]
+    def statuses_since(self, since_epoch: int) -> dict[str, str]:
+        return {r["id"]: r["status"] for r in self.query("SELECT id, status FROM events WHERE ts_epoch >= ?", [since_epoch])}
+
+    def latest_event_epoch(self, integration_id: int) -> int | None:
+        row = self.query("SELECT MAX(ts_epoch) AS t FROM events WHERE integration_id = ?", [integration_id])[0]
+        return row["t"]
+
+    def delete_events_before(self, epoch: int) -> int:
+        return self.execute("DELETE FROM events WHERE ts_epoch < ?", [epoch]).rowcount
+
+    def delete_events_of(self, integration_id: int) -> int:
+        return self.execute("DELETE FROM events WHERE integration_id = ?", [integration_id]).rowcount
+
+    def event_counts_by_integration(self, since_epoch: int) -> dict[int, int]:
+        rows = self.query("SELECT integration_id, COUNT(*) AS n FROM events WHERE ts_epoch >= ? GROUP BY integration_id",
+                          [since_epoch])
+        return {r["integration_id"]: r["n"] for r in rows}
+
+    # ---------- integrations ----------
+
+    def add_integration(self, data: dict[str, Any]) -> int:
+        data = {k: data[k] for k in INTEGRATION_COLUMNS if k in data}
+        data["created_at"] = _now()
+        cols = ", ".join(data)
+        marks = ", ".join("?" * len(data))
+        return self.execute(f"INSERT INTO integrations ({cols}) VALUES ({marks})", _encode(data).values()).lastrowid
+
+    def update_integration(self, integration_id: int, data: dict[str, Any]) -> bool:
+        data = {k: data[k] for k in INTEGRATION_COLUMNS if k in data}
+        if not data:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in data)
+        return self.execute(f"UPDATE integrations SET {sets} WHERE id = ?",
+                            [*_encode(data).values(), integration_id]).rowcount > 0
+
+    def delete_integration(self, integration_id: int) -> bool:
+        return self.execute("DELETE FROM integrations WHERE id = ?", [integration_id]).rowcount > 0
+
+    def get_integration(self, integration_id: int) -> dict[str, Any] | None:
+        rows = self.query("SELECT * FROM integrations WHERE id = ?", [integration_id])
+        return _decode(rows[0]) if rows else None
+
+    def integration_by_token_hash(self, token_hash: str) -> dict[str, Any] | None:
+        rows = self.query("SELECT * FROM integrations WHERE webhook_token_hash = ?", [token_hash])
+        return _decode(rows[0]) if rows else None
+
+    def list_integrations(self) -> list[dict[str, Any]]:
+        return [_decode(r) for r in self.query("SELECT * FROM integrations ORDER BY id")]
 
     # ---------- vendors ----------
 
     def add_vendor(self, v: dict[str, Any]) -> int:
-        return self._execute(
+        return self.execute(
             """INSERT INTO vendors (name, service, data_sensitivity, access_level, answers, inherent_risk,
                                     control_score, residual_risk, tier, gaps, created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             [v["name"], v["service"], v["data_sensitivity"], v["access_level"], json.dumps(v["answers"]),
              v["inherent_risk"], v["control_score"], v["residual_risk"], v["tier"], json.dumps(v["gaps"]), _now()],
-        )
+        ).lastrowid
 
     def list_vendors(self) -> list[dict[str, Any]]:
         out = []
-        for r in self._query("SELECT * FROM vendors ORDER BY residual_risk DESC"):
+        for r in self.query("SELECT * FROM vendors ORDER BY residual_risk DESC"):
             d = dict(r)
             d["answers"] = json.loads(d["answers"])
             d["gaps"] = json.loads(d["gaps"])
@@ -190,20 +233,43 @@ class Database:
         return out
 
     def delete_vendor(self, vendor_id: int) -> bool:
-        with self._lock, self._conn:
-            return self._conn.execute("DELETE FROM vendors WHERE id = ?", (vendor_id,)).rowcount > 0
+        return self.execute("DELETE FROM vendors WHERE id = ?", (vendor_id,)).rowcount > 0
 
     def vendor_count(self) -> int:
-        return self._query("SELECT COUNT(*) AS n FROM vendors")[0]["n"]
+        return self.query("SELECT COUNT(*) AS n FROM vendors")[0]["n"]
 
 
-def row_to_alert(r: sqlite3.Row) -> Alert:
-    a = Alert(
-        source=r["source"], source_id=r["source_id"], timestamp=datetime.fromisoformat(r["timestamp"]),
-        host=r["host"], rule_id=r["rule_id"], title=r["title"], category=r["category"],
-        severity=r["severity"], src_ip=r["src_ip"], dst_ip=r["dst_ip"], user=r["user"],
-        mitre_tactic=r["mitre_tactic"], mitre_technique=r["mitre_technique"], raw=json.loads(r["raw"]),
+_JSON_COLUMNS = ("config", "mapping", "state")
+
+
+def _encode(data: dict[str, Any]) -> dict[str, Any]:
+    out = dict(data)
+    for k in _JSON_COLUMNS:
+        if k in out and not isinstance(out[k], str):
+            out[k] = json.dumps(out[k])
+    for k in ("enabled", "demo"):
+        if k in out:
+            out[k] = int(bool(out[k]))
+    return out
+
+
+def _decode(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    for k in _JSON_COLUMNS:
+        d[k] = json.loads(d[k] or "{}")
+    d["enabled"] = bool(d["enabled"])
+    d["demo"] = bool(d["demo"])
+    return d
+
+
+def row_to_event(r: sqlite3.Row) -> Event:
+    e = Event(
+        integration_id=r["integration_id"], tool=r["tool"], source_id=r["source_id"],
+        timestamp=datetime.fromisoformat(r["timestamp"]), host=r["host"], message=r["message"],
+        severity=r["severity"], category=r["category"], src_ip=r["src_ip"], dst_ip=r["dst_ip"], user=r["user"],
+        rule=r["rule"], action=r["action"], mitre_tactic=r["mitre_tactic"], mitre_technique=r["mitre_technique"],
+        raw=json.loads(r["raw"]),
     )
-    a.risk_score = r["risk_score"]
-    a.risk_factors = json.loads(r["risk_factors"])
-    return a
+    e.risk_score = r["risk_score"]
+    e.risk_factors = json.loads(r["risk_factors"])
+    return e

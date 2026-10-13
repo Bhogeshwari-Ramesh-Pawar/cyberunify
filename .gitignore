@@ -5,3 +5,7 @@ __pycache__/
 *.db
 .pytest_cache/
 reports/
+.cyberunify.key
+*.key
+*.db-wal
+*.db-shm

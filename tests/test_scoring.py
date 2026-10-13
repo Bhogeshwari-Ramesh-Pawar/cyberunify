@@ -1,14 +1,15 @@
 from datetime import datetime, timedelta, timezone
 
-from app.models import Alert, risk_level
+from app.models import Event, risk_level
 from app.scoring import anomaly_z_scores, host_risk, rarity_signals, score_alerts, score_one
 
 NOW = datetime(2026, 10, 13, 12, tzinfo=timezone.utc)
 
 
 def make(severity=50, host="h1", rule="r1", tactic=None, minutes_ago=0, i=0):
-    return Alert(source="test", source_id=f"{rule}-{host}-{i}-{minutes_ago}", timestamp=NOW - timedelta(minutes=minutes_ago),
-                 host=host, rule_id=rule, title=rule, category="other", severity=severity, mitre_tactic=tactic)
+    return Event(integration_id=1, tool="test", source_id=f"{rule}-{host}-{i}-{minutes_ago}",
+                 timestamp=NOW - timedelta(minutes=minutes_ago), host=host, rule=rule, message=rule,
+                 category="other", severity=severity, mitre_tactic=tactic)
 
 
 def test_score_never_exceeds_100_even_with_every_boost():
@@ -39,7 +40,7 @@ def test_low_value_asset_dampens():
 def test_rarity_rare_rule_scores_higher():
     alerts = [make(rule="noisy", i=i) for i in range(20)] + [make(rule="rare")]
     r = rarity_signals(alerts)
-    assert r["rare"] > r["noisy"] >= 0
+    assert r["test:rare"] > r["test:noisy"] >= 0
 
 
 def test_anomaly_detects_burst_hour():

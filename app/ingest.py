@@ -1,64 +1,111 @@
-"""Ingestion pipeline: fetch → normalize → store → rescore the whole window."""
+"""Pipeline: raw records → mapped events → stored → scored.
+
+Push integrations (webhook, syslog) call `store_records` as data arrives; pull integrations
+(Elasticsearch, Splunk, REST, file) are fetched by `pull_integration` on a schedule or on demand.
+`rescore_window` recomputes risk for the whole window, because rarity and per-host
+baselines depend on everything that has been seen.
+"""
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
-import httpx
-
+from .collectors import CollectorError, pull
 from .config import Settings
-from .connectors.base import Connector
-from .connectors.demo import DemoConnector
-from .connectors.elastic import ElasticConnector
-from .connectors.suricata import SuricataConnector
-from .connectors.wazuh import WazuhConnector
 from .db import Database
-from .scoring import score_alerts
+from .mapping import map_record
+from .models import Event
+from .presets import CONNECTION_TYPES, secret_keys
+from .scoring import score_alerts, score_one
+from .vault import SecretBox
 
 log = logging.getLogger("cyberunify.ingest")
 
 
-def build_connectors(s: Settings) -> list[Connector]:
-    connectors: list[Connector] = []
-    if s.wazuh_url:
-        connectors.append(WazuhConnector(s.wazuh_url, s.wazuh_user, s.wazuh_password, s.wazuh_index, s.wazuh_verify_tls))
-    if s.elastic_url:
-        connectors.append(ElasticConnector(s.elastic_url, s.elastic_api_key, s.elastic_index, s.elastic_verify_tls))
-    if s.suricata_eve_path:
-        connectors.append(SuricataConnector(s.suricata_eve_path, s.asset_inventory))
-    if s.demo_mode:
-        connectors.append(DemoConnector(s.asset_inventory))
-    return connectors
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def run_ingest(db: Database, settings: Settings, connectors: list[Connector] | None = None) -> list[dict]:
-    """Pull from every connector, then rescore all alerts in the window.
-
-    Rescoring the window (not just new alerts) matters: rarity and the per-host
-    baseline depend on everything we've seen, so old scores shift as context grows.
-    A failing connector is recorded and skipped; it never stops the others.
-    """
-    connectors = connectors if connectors is not None else build_connectors(settings)
-    now = datetime.now(timezone.utc)
-    window_start = now - timedelta(hours=settings.window_hours)
-    results = []
-
-    for conn in connectors:
-        started = datetime.now(timezone.utc)
-        since = max(db.latest_alert_time(conn.name) or window_start, window_start)
+def map_records(integration: dict[str, Any], records: list[dict[str, Any]], settings: Settings) -> tuple[list[Event], int]:
+    """Map raw records with the integration's mapping. Returns (events, records skipped)."""
+    events, skipped = [], 0
+    for record in records:
         try:
-            alerts, skipped = conn.fetch(since)
-            db.upsert_alerts(alerts)
-            db.record_run(conn.name, started, "ok", len(alerts), skipped, None)
-            results.append({"source": conn.name, "status": "ok", "fetched": len(alerts), "skipped": skipped})
-        except (httpx.HTTPError, OSError, ValueError) as err:
-            message = f"{type(err).__name__}: {err}"
-            log.warning("connector %s failed: %s", conn.name, message)
-            db.record_run(conn.name, started, "error", 0, 0, message[:500])
-            results.append({"source": conn.name, "status": "error", "error": message})
+            event, _ = map_record(
+                record,
+                integration_id=integration["id"],
+                tool=integration["tool"],
+                mapping=integration.get("mapping") or {},
+                severity_scale=integration.get("severity_scale") or "auto",
+                default_category=integration.get("default_category"),
+                inventory=settings.asset_inventory,
+                fallback_host=integration["name"],
+            )
+        except (ValueError, TypeError, KeyError) as err:
+            skipped += 1
+            log.debug("integration %s: skipped record: %s", integration["id"], err)
+            continue
+        # A first score straight away so new events show up ranked; the window rescore refines it.
+        event.risk_score, event.risk_factors = score_one(
+            event.severity, event.mitre_tactic, settings.asset_criticality.get(event.host, 1.0), 0.0, 0.0)
+        events.append(event)
+    return events, skipped
 
-    window = db.alerts_since(window_start)
-    score_alerts(window, settings.asset_criticality)
-    db.upsert_alerts(window)
+
+def store_records(db: Database, integration: dict[str, Any], records: list[dict[str, Any]], settings: Settings) -> dict[str, int]:
+    events, skipped = map_records(integration, records, settings)
+    cutoff = _now() - timedelta(hours=settings.window_hours)
+    events = [e for e in events if e.timestamp >= cutoff]  # outside retention: don't store
+    db.upsert_events(events)
+    db.update_integration(integration["id"], {
+        "last_status": "ok", "last_error": None, "last_run_at": _now().isoformat(), "last_count": len(events),
+    })
+    return {"stored": len(events), "skipped": skipped}
+
+
+def pull_integration(db: Database, integration: dict[str, Any], settings: Settings, box: SecretBox,
+                     transport=None) -> dict[str, Any]:
+    conn_type = integration["type"]
+    window_start = _now() - timedelta(hours=settings.window_hours)
+    latest = db.latest_event_epoch(integration["id"])
+    # Overlap by a minute so late-indexed events aren't missed; stable ids make repeats harmless.
+    since = max(window_start, datetime.fromtimestamp(latest - 60, tz=timezone.utc)) if latest else window_start
+    try:
+        cfg = box.open(integration["config"], secret_keys(conn_type))
+        records, state = pull(conn_type, cfg, since, integration.get("state") or {}, transport=transport)
+    except (CollectorError, ValueError) as err:
+        db.update_integration(integration["id"], {"last_status": "error", "last_error": str(err)[:500],
+                                                  "last_run_at": _now().isoformat()})
+        return {"integration": integration["name"], "status": "error", "error": str(err)}
+    result = store_records(db, integration, records, settings)
+    db.update_integration(integration["id"], {"state": state})
+    return {"integration": integration["name"], "status": "ok", **result}
+
+
+def rescore_window(db: Database, settings: Settings) -> int:
+    since = int((_now() - timedelta(hours=settings.window_hours)).timestamp())
+    events = db.events_since(since)
+    score_alerts(events, settings.asset_criticality)
+    db.update_scores(events)
+    return len(events)
+
+
+def run_cycle(db: Database, settings: Settings, box: SecretBox, simulator=None) -> list[dict[str, Any]]:
+    """One scheduler tick: pull every enabled pull-integration, feed demo data, prune, rescore."""
+    results = []
+    for integ in db.list_integrations():
+        if not integ["enabled"]:
+            continue
+        if integ["demo"]:
+            if simulator is not None:
+                records = simulator.records_for(integ["tool"])
+                results.append({"integration": integ["name"], "status": "ok", "demo": True,
+                                **store_records(db, integ, records, settings)})
+            continue
+        if CONNECTION_TYPES[integ["type"]]["mode"] == "pull":
+            results.append(pull_integration(db, integ, settings, box))
+    db.delete_events_before(int((_now() - timedelta(hours=settings.window_hours)).timestamp()))
+    rescore_window(db, settings)
     return results

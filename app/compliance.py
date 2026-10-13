@@ -8,7 +8,8 @@ A control's status reflects the worst *unresolved* alert mapped to it:
   Effective     only low/resolved alerts — the control is monitored and holding
   No evidence   nothing mapped yet (not a pass: you can't show it works)
 
-Logging (A.8.15) and monitoring (A.8.16) are assessed from data-source health.
+Logging (A.8.15) is assessed from integration health, monitoring (A.8.16) and
+response (A.5.26) from untriaged high-risk events.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .models import Alert
+from .models import Event
 
 CONTROLS: dict[str, str] = {
     "A.5.7": "Threat intelligence",
@@ -47,6 +48,8 @@ CATEGORY_CONTROLS: dict[str, list[str]] = {
     "privilege_escalation": ["A.8.2"],
     "data_exfiltration": ["A.8.12", "A.8.20"],
     "policy": ["A.8.1"],
+    "threat_intel": ["A.5.7"],
+    "network_traffic": ["A.8.20"],
 }
 
 RECOMMENDATIONS: dict[str, str] = {
@@ -94,13 +97,13 @@ def _status_for(open_levels: Counter) -> str:
 
 
 def assess(
-    alerts: list[Alert],
+    alerts: list[Event],
     statuses: dict[str, str],
     source_health: list[dict],
     vendors: list[dict] | None = None,
 ) -> dict:
     vendors = vendors or []
-    by_control: dict[str, list[Alert]] = defaultdict(list)
+    by_control: dict[str, list[Event]] = defaultdict(list)
     for a in alerts:
         for control in CATEGORY_CONTROLS.get(a.category, []):
             by_control[control].append(a)
@@ -114,13 +117,13 @@ def assess(
             res.status = _status_for(Counter(a.risk_level for a in open_items))
             res.max_risk = max(a.risk_score for a in items)
             # Top three *distinct* findings (the same rule firing 40 times is one finding).
-            seen: dict[tuple[str, str], tuple[Alert, int]] = {}
+            seen: dict[tuple[str, str], tuple[Event, int]] = {}
             for a in sorted(open_items or items, key=lambda a: a.risk_score, reverse=True):
-                key = (a.host, a.title)
+                key = (a.host, a.message)
                 first_seen, n = seen.get(key, (a, 0))
                 seen[key] = (first_seen, n + 1)
             res.evidence = [
-                f"{a.host}: {a.title} (risk {a.risk_score:.0f}{f', ×{n}' if n > 1 else ''})"
+                f"{a.host}: {a.message} (risk {a.risk_score:.0f}{f', ×{n}' if n > 1 else ''})"
                 for a, n in list(seen.values())[:3]
             ]
         results.append(res)
@@ -136,10 +139,10 @@ def assess(
         logging_ctl.status = "No evidence"
     elif failing:
         logging_ctl.status = "At risk" if not healthy else "Needs review"
-        logging_ctl.evidence = [f"Failing source: {s}" for s in failing]
+        logging_ctl.evidence = [f"Failing integration: {s}" for s in failing]
     else:
         logging_ctl.status = "Effective"
-        logging_ctl.evidence = [f"{len(healthy)} source(s) ingesting: {', '.join(healthy)}"]
+        logging_ctl.evidence = [f"{len(healthy)} integration(s) delivering logs: {', '.join(healthy)}"]
 
     # A.8.16 Monitoring and A.5.26 Response: is anything high-risk left untriaged?
     open_high = [a for a in alerts if statuses.get(a.id, "open") == "open" and a.risk_level in ("critical", "high")]
@@ -149,12 +152,12 @@ def assess(
         ctl.open_alerts = len(open_high)
         ctl.status = ("At risk" if open_high else "Effective") if alerts else "No evidence"
         ctl.max_risk = max((a.risk_score for a in open_high), default=0.0)
-        ctl.evidence = [f"{len(open_high)} critical/high alert(s) awaiting triage"] if open_high else ["All high-risk alerts triaged"]
+        ctl.evidence = [f"{len(open_high)} critical/high event(s) awaiting triage"] if open_high else ["All high-risk events triaged"]
 
     # A.5.24 Incident planning: evidenced by having alerting + triage workflow in place.
     planning = by_id["A.5.24"]
     planning.status = "Effective" if alerts else "No evidence"
-    planning.evidence = ["Alert triage workflow in use (open → acknowledged → closed)"] if alerts else []
+    planning.evidence = ["Event triage workflow in use (open → acknowledged → closed)"] if alerts else []
 
     # A.5.19 Supplier relationships: from the third-party risk module.
     supplier = by_id["A.5.19"]

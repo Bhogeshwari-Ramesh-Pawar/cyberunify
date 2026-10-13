@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from statistics import mean, pstdev
 
-from .models import Alert, risk_level
+from .models import Event, risk_level
 
 TACTIC_BOOST = {
     "impact": 0.30,
@@ -52,16 +52,16 @@ def _hour(ts: datetime) -> datetime:
     return ts.replace(minute=0, second=0, microsecond=0)
 
 
-def rarity_signals(alerts: list[Alert]) -> dict[str, float]:
+def rarity_signals(alerts: list[Event]) -> dict[str, float]:
     """Inverse document frequency of each rule, scaled to 0 … RARITY_MAX."""
-    counts = Counter(a.rule_id for a in alerts)
+    counts = Counter(a.rule_key for a in alerts)
     total = len(alerts)
     if total <= 1:
         return {rule: 0.0 for rule in counts}
     return {rule: RARITY_MAX * math.log(total / n) / math.log(total) for rule, n in counts.items()}
 
 
-def anomaly_z_scores(alerts: list[Alert]) -> dict[tuple[str, datetime], float]:
+def anomaly_z_scores(alerts: list[Event]) -> dict[tuple[str, datetime], float]:
     """For each (host, hour): standard deviations above that host's usual hourly alert volume."""
     per_host: dict[str, Counter] = defaultdict(Counter)
     for a in alerts:
@@ -117,8 +117,8 @@ def score_one(severity: float, tactic: str | None, criticality: float, rarity: f
     return round(min(100.0, risk), 1), factors
 
 
-def score_alerts(alerts: list[Alert], asset_criticality: dict[str, float] | None = None) -> list[Alert]:
-    """Score every alert in place; the batch provides the rarity and baseline context."""
+def score_alerts(alerts: list[Event], asset_criticality: dict[str, float] | None = None) -> list[Event]:
+    """Score every event in place; the batch provides the rarity and baseline context."""
     asset_criticality = asset_criticality or {}
     rarity = rarity_signals(alerts)
     z = anomaly_z_scores(alerts)
@@ -127,14 +127,14 @@ def score_alerts(alerts: list[Alert], asset_criticality: dict[str, float] | None
             a.severity,
             a.mitre_tactic,
             asset_criticality.get(a.host, 1.0),
-            rarity.get(a.rule_id, 0.0),
+            rarity.get(a.rule_key, 0.0),
             z.get((a.host, _hour(a.timestamp)), 0.0),
         )
     return alerts
 
 
-def host_risk(alerts: list[Alert]) -> list[dict]:
-    by_host: dict[str, list[Alert]] = defaultdict(list)
+def host_risk(alerts: list[Event]) -> list[dict]:
+    by_host: dict[str, list[Event]] = defaultdict(list)
     for a in alerts:
         by_host[a.host].append(a)
 
@@ -152,9 +152,9 @@ def host_risk(alerts: list[Alert]) -> list[dict]:
             "alerts": len(items),
             "critical": levels.get("critical", 0),
             "high": levels.get("high", 0),
-            "top_alert": items[0].title,
+            "top_alert": items[0].message,
             "last_seen": max(a.timestamp for a in items).isoformat(),
-            "sources": sorted({a.source for a in items}),
+            "tools": sorted({a.tool for a in items}),
         })
     rows.sort(key=lambda r: r["risk_score"], reverse=True)
     return rows

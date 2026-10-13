@@ -3,13 +3,13 @@ from datetime import datetime, timezone
 import pytest
 
 from app.compliance import assess
-from app.models import Alert
+from app.models import Event
 from app.vendors import QUESTIONS, assess_vendor
 
 
 def alert(category, risk, sid="1"):
-    a = Alert(source="t", source_id=sid, timestamp=datetime.now(timezone.utc), host="h", rule_id="r",
-              title="t", category=category, severity=50)
+    a = Event(integration_id=1, tool="t", source_id=sid, timestamp=datetime.now(timezone.utc), host="h",
+              message="t", category=category, severity=50)
     a.risk_score = risk
     return a
 
